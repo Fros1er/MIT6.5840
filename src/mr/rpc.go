@@ -14,16 +14,34 @@ import "strconv"
 // and reply for an RPC.
 //
 
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // Add your RPC definitions here.
 
+type WorkType int
+
+const (
+	None WorkType = iota
+	WMap
+	WReduce
+	WWait
+	WDone
+)
+
+type GetIdArgs struct {
+}
+
+type GetIdReply struct {
+	Id      int
+	NReduce int
+}
+
+type GetWorkArgs struct {
+	Id int
+}
+
+type GetWorkReply struct {
+	Work WorkType
+	Data string
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
