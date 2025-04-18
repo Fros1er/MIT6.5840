@@ -1,7 +1,14 @@
 package lock
 
 import (
+	kvsrv "6.5840/kvsrv1"
+	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
+	"sync"
+)
+
+const (
+	Free = "Free"
 )
 
 type Lock struct {
@@ -11,6 +18,11 @@ type Lock struct {
 	// MakeLock().
 	ck kvtest.IKVClerk
 	// You may add code here
+	key     string
+	locked  bool
+	version rpc.Tversion
+	id      string
+	mtx     sync.Mutex
 }
 
 // The tester calls MakeLock() and passes in a k/v clerk; your code can
@@ -21,13 +33,82 @@ type Lock struct {
 func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 	lk := &Lock{ck: ck}
 	// You may add code here
+	lk.key = l
+	lk.id = kvtest.RandValue(8)
+	lk.mtx = sync.Mutex{}
 	return lk
 }
 
 func (lk *Lock) Acquire() {
 	// Your code here
+	lk.mtx.Lock()
+	defer lk.mtx.Unlock()
+	if lk.locked {
+		return
+	}
+
+	retried := false
+	for {
+		value, version, err := lk.ck.Get(lk.key)
+		//kvsrv.DPrintf("[Client] Get %v %v %v %v\n", lk.key, value, version, err)
+		if err == rpc.OK && value != Free {
+			if retried && value == lk.id {
+				lk.locked = true
+				lk.version = version
+				return
+			}
+			continue
+		}
+		if err == rpc.ErrNoKey {
+			version = 0
+		}
+
+		putErr := lk.ck.Put(lk.key, lk.id, version)
+		kvsrv.DPrintf("[Client] %v Put %v %v %v %v\n", lk.id, lk.key, lk.id, version, putErr)
+		version += 1
+		switch putErr {
+		case rpc.ErrVersion:
+			continue
+		case rpc.OK:
+			lk.locked = true
+			lk.version = version
+			return
+		case rpc.ErrMaybe:
+			retried = true
+			continue
+		default:
+			panic(putErr)
+		}
+	}
 }
 
 func (lk *Lock) Release() {
 	// Your code here
+	lk.mtx.Lock()
+	defer lk.mtx.Unlock()
+	if !lk.locked {
+		return
+	}
+	var putErr rpc.Err
+	retried := false
+outer:
+	for {
+		putErr = lk.ck.Put(lk.key, Free, lk.version)
+		switch putErr {
+		case rpc.OK:
+			break outer
+		case rpc.ErrMaybe:
+			retried = true
+			continue
+		case rpc.ErrVersion:
+			if retried {
+				break outer
+			}
+			panic(putErr)
+		default:
+			panic(putErr)
+		}
+	}
+	kvsrv.DPrintf("[Client] %v Put %v %v %v %v\n", lk.id, lk.key, Free, lk.version, putErr)
+	lk.locked = false
 }
