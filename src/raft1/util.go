@@ -15,6 +15,16 @@ func DPrintf(format string, a ...interface{}) {
 	}
 }
 
+//const FuncTrace = true
+
+const FuncTrace = false
+
+func FTracef(format string, a ...interface{}) {
+	if FuncTrace {
+		log.Printf(format, a...)
+	}
+}
+
 func todo() {
 	panic("Not implemented")
 }
