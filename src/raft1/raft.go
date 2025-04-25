@@ -39,10 +39,14 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	isLeader           atomic.Bool
+	isLeader           bool
 	nextIndex          []int
 	matchIndex         []int
 	receivedFromLeader chan struct{}
+
+	isVoting  bool
+	voted     []bool
+	votedLock sync.Mutex
 }
 
 func electionTimeout() time.Duration {
@@ -77,10 +81,11 @@ func (rf *Raft) hasMajority(n int) bool {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//log.Printf("Node %d enter GetState", rf.me)
 	//var term int
 	//var isleader bool
 	// Your code here (3A).
-	return rf.currentTerm, rf.isLeader.Load()
+	return rf.currentTerm, rf.isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -157,9 +162,11 @@ type RequestVoteReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	assert(args.CandidateId != rf.me, "self RequestVote should not happen")
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//log.Printf("Node %d enter ReqVote", rf.me)
 
 	reply.VoteGranted = false
 
@@ -169,15 +176,31 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	if args.Term > rf.currentTerm {
+		log.Printf("Node %d (prevTerm=%d)'s term updated in RequestVote.", rf.me, rf.currentTerm)
+		if rf.isVoting {
+			log.Printf("Node %d (term=%d)'s vote cancelled due to ReqVote\n", rf.me, rf.currentTerm)
+		}
+		rf.isVoting = false
+		if rf.isLeader {
+			log.Printf("Node %d (term=%d) no longer a leader due to ReqVote\n", rf.me, rf.currentTerm)
+		}
+		rf.isLeader = false
+		rf.updateTerm(args.Term)
+	}
+
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		assert(rf.isVoting == false, "Should not happen")
+		assert(rf.isLeader == false, "Should not happen")
 		lastLogIndex, lastLogTerm := rf.lastLogInfo()
 		if args.LastLogTerm >= lastLogTerm && args.LastLogIndex >= lastLogIndex {
 			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			log.Printf("Node %d (prevTerm%d) vote to Node %d (term=%d)\n", rf.me, rf.currentTerm, args.CandidateId, args.Term)
+			rf.receivedFromLeader <- struct{}{}
+		} else {
+			todo()
 		}
-		rf.votedFor = args.CandidateId
-		log.Printf("Node %d (prevTerm%d) vote to Node %d (term=%d)\n", rf.me, rf.currentTerm, args.CandidateId, args.Term)
-		rf.updateTerm(args.Term)
-		rf.receivedFromLeader <- struct{}{}
 		return
 	} else {
 		log.Printf("Node %d (term=%d) No vote to Node %d (term=%d): votedFor=%d\n", rf.me, rf.currentTerm, args.CandidateId, args.Term, rf.votedFor)
@@ -237,17 +260,44 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	assert(args.LeaderId != rf.me, "self AppendEntries should not happen")
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//log.Printf("Node %d enter AppendE", rf.me)
 
 	if args.Term < rf.currentTerm {
+		log.Printf("Node %d (term=%d) observed outdated AppendEntries from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-	reply.Success = true
-	rf.updateTerm(args.Term)
 
+	log.Printf("Node %d (term=%d): received AppendEntries from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+
+	if args.Term == rf.currentTerm {
+		assert(!rf.isLeader, "term have two leader!")
+		if rf.isVoting {
+			log.Printf("Node %d (prevTerm=%d) cancel a vote due to AppendEntries.", rf.me, rf.currentTerm)
+			rf.isVoting = false
+			rf.updateTerm(args.Term)
+			rf.votedFor = args.LeaderId
+		}
+	}
+	if args.Term > rf.currentTerm {
+		log.Printf("Node %d (prevTerm=%d)'s term updated in AppendEntries.", rf.me, rf.currentTerm)
+		if rf.isLeader {
+			log.Printf("Node %d (prevTerm=%d) no longer a leader due to AppendEntries.", rf.me, rf.currentTerm)
+		}
+		if rf.isVoting {
+			log.Printf("Node %d (prevTerm=%d) cancel a vote due to AppendEntries.", rf.me, rf.currentTerm)
+		}
+		rf.isLeader = false
+		rf.isVoting = false
+		rf.updateTerm(args.Term)
+		rf.votedFor = args.LeaderId
+	}
+
+	reply.Success = true
 	rf.receivedFromLeader <- struct{}{}
 }
 
@@ -300,9 +350,73 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) startVoting() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	//log.Printf("Node %d enter startVoting", rf.me)
+
+	rf.isVoting = true
+	rf.isLeader = false
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.votedLock.Lock()
+	clear(rf.voted)
+	rf.votedLock.Unlock()
 	log.Printf("Node %d timeout, startVoting for term %d\n", rf.me, rf.currentTerm)
+}
+
+func (rf *Raft) heartBeat() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	assert(rf.isLeader, "Non-leader called heartbeat!")
+	//log.Printf("Node %d enter heartbeat", rf.me)
+
+	arg := AppendEntriesArgs{
+		Term:     rf.currentTerm,
+		LeaderId: rf.me,
+	}
+
+	wg := new(sync.WaitGroup)
+	replyChan := make(chan AppendEntriesReply, len(rf.peers))
+	timeoutChan := make(chan struct{})
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(i, &arg, &reply)
+			select {
+			case <-timeoutChan:
+			default:
+				if ok {
+					replyChan <- reply
+				}
+			}
+			wg.Done()
+		}()
+	}
+
+	go func() {
+		if waitTimeout(wg, time.Millisecond*100) {
+			close(timeoutChan)
+		}
+		close(replyChan)
+	}()
+
+	for reply := range replyChan {
+		if !reply.Success {
+			assert(rf.currentTerm < reply.Term, "currentTerm >= reply.Term!")
+			log.Printf("Node %d (term=%d) observed Term %d, no longer a leader\n", rf.me, rf.currentTerm, reply.Term)
+			rf.isLeader = false
+			rf.updateTerm(reply.Term)
+			break
+		}
+	}
+}
+
+func (rf *Raft) doVote() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//log.Printf("Node %d enter doVote", rf.me)
 
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 
@@ -315,21 +429,35 @@ func (rf *Raft) startVoting() {
 
 	wg := new(sync.WaitGroup)
 	replyChan := make(chan RequestVoteReply, len(rf.peers))
+	timeoutChan := make(chan struct{})
+	rf.votedLock.Lock()
 	for i := range rf.peers {
-		if i == rf.me {
+		if i == rf.me || rf.voted[i] {
 			continue
 		}
 		wg.Add(1)
 		go func() {
 			reply := RequestVoteReply{}
-			rf.sendRequestVote(i, &arg, &reply)
-			replyChan <- reply
+			ok := rf.sendRequestVote(i, &arg, &reply)
+			select {
+			case <-timeoutChan:
+			default:
+				if ok {
+					replyChan <- reply
+					rf.votedLock.Lock()
+					rf.voted[i] = true
+					rf.votedLock.Unlock()
+				}
+			}
 			wg.Done()
 		}()
 	}
+	rf.votedLock.Unlock()
 
 	go func() {
-		wg.Wait()
+		if waitTimeout(wg, time.Millisecond*100) {
+			close(timeoutChan)
+		}
 		close(replyChan)
 	}()
 
@@ -337,6 +465,9 @@ func (rf *Raft) startVoting() {
 	for reply := range replyChan {
 		if reply.VoteGranted {
 			voted += 1
+			if rf.hasMajority(voted) {
+				break
+			}
 		} else if reply.Term >= rf.currentTerm {
 			log.Printf("Node %d observed larger Term %d, curr %d\n", rf.me, reply.Term, rf.currentTerm)
 			rf.updateTerm(reply.Term)
@@ -346,74 +477,49 @@ func (rf *Raft) startVoting() {
 
 	if rf.hasMajority(voted) {
 		// became leader
-		rf.isLeader.Store(true)
+		rf.isLeader = true
+		rf.isVoting = false
 		log.Printf("Node %d is voted as leader of Term %d\n", rf.me, rf.currentTerm)
 		return
 	}
 
-	log.Printf("Node %d failed to get enough vote in Term %d\n", rf.me, rf.currentTerm)
-}
-
-func (rf *Raft) heartBeat() {
-	assert(rf.isLeader.Load(), "Non-leader called heartbeat!")
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	arg := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-
-	wg := new(sync.WaitGroup)
-	replyChan := make(chan AppendEntriesReply, len(rf.peers))
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			reply := AppendEntriesReply{}
-			if rf.sendAppendEntries(i, &arg, &reply) {
-				replyChan <- reply
-			}
-			wg.Done()
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(replyChan)
-	}()
-
-	for reply := range replyChan {
-		if !reply.Success {
-			assert(rf.currentTerm >= reply.Term, "currentTerm >= reply.Term!")
-			log.Printf("Node %d (term=%d) observed Term %d, no longer a leader\n", rf.me, rf.currentTerm, reply.Term)
-			rf.isLeader.Store(false)
-			rf.updateTerm(reply.Term)
-			break
-		}
-	}
+	log.Printf("Node %d failed to get enough vote in Term %d (got %d)\n", rf.me, rf.currentTerm, voted)
 }
 
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here (3A)
 		// Check if a leader election should be started.
-		if rf.isLeader.Load() {
-			select {
-			case <-time.After(time.Millisecond * 100):
-				rf.heartBeat()
-			case <-rf.receivedFromLeader:
-				panic("TODO: leader received from leader")
+		timeout := electionTimeout()
+		start := time.Now()
+		for {
+			rf.mu.Lock()
+			//log.Printf("Node %d enter ticker", rf.me)
+			isLeader := rf.isLeader
+			isVoting := rf.isVoting
+			rf.mu.Unlock()
+			if !(isLeader || time.Since(start) < timeout) {
+				break
 			}
-		} else {
+
+			startInner := time.Now()
+			if isVoting {
+				rf.doVote()
+			} else if isLeader {
+				rf.heartBeat()
+			}
 			select {
-			case <-time.After(electionTimeout()):
-				rf.startVoting()
+			case <-time.After(time.Millisecond*time.Duration(50+rand.Int63n(100)) - time.Since(startInner)):
+				// Do nothing
+			case <-time.After(timeout - time.Since(start)):
+				break
 			case <-rf.receivedFromLeader:
-				// DO Nothing
+				// guarantee we are follower here
+				start = time.Now()
 			}
 		}
+		// timeout!
+		rf.startVoting()
 	}
 
 	// pause for a random amount of time between 50 and 350
@@ -439,10 +545,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		votedFor:           -1,
 		log:                make([]any, 0),
 		logTerm:            make([]int, 0),
-		isLeader:           atomic.Bool{},
+		isLeader:           false,
 		nextIndex:          make([]int, n),
 		matchIndex:         make([]int, n),
-		receivedFromLeader: make(chan struct{}),
+		receivedFromLeader: make(chan struct{}, 1),
+		isVoting:           false,
+		voted:              make([]bool, n),
 	}
 	rf.peers = peers
 	rf.persister = persister

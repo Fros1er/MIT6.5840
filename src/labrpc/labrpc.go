@@ -242,6 +242,7 @@ func (rn *Network) processReq(req reqMsg) {
 		if reliable == false {
 			// short delay
 			ms := (rand.Int() % SHORTDELAY)
+			log.Printf("Network will delay for %dms\n", ms)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 

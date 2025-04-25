@@ -2,7 +2,6 @@ package raft
 
 import (
 	"log"
-	"reflect"
 	"sync"
 	"time"
 )
@@ -16,15 +15,30 @@ func DPrintf(format string, a ...interface{}) {
 	}
 }
 
+func todo() {
+	panic("Not implemented")
+}
+
 func assert(assertion bool, msg string) {
 	if !assertion {
 		panic(msg)
 	}
 }
 
+func assertf(assertion bool, format string, a ...interface{}) {
+	if !assertion {
+		log.Panicf(format, a...)
+	}
+}
+
 func mutexLocked(m *sync.Mutex) bool {
-	state := reflect.ValueOf(m).Elem().FieldByName("state")
-	return state.Int()&1 == 1
+	notLocked := m.TryLock()
+	if notLocked {
+		m.Unlock()
+	}
+	return !notLocked
+	//state := reflect.ValueOf(m).Elem().FieldByName("state")
+	//return state.Int()&1 == 1
 }
 
 func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
