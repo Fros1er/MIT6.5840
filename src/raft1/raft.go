@@ -69,6 +69,8 @@ func (rf *Raft) updateTerm(newTerm int) {
 	if rf.currentTerm < newTerm {
 		rf.votedFor = -1
 		rf.currentTerm = newTerm
+		rf.isVoting = false
+		rf.isLeader = false
 	}
 }
 
@@ -182,11 +184,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.isVoting {
 			log.Printf("Node %d (term=%d)'s vote cancelled due to ReqVote\n", rf.me, rf.currentTerm)
 		}
-		rf.isVoting = false
 		if rf.isLeader {
 			log.Printf("Node %d (term=%d) no longer a leader due to ReqVote\n", rf.me, rf.currentTerm)
 		}
-		rf.isLeader = false
 		rf.updateTerm(args.Term)
 	}
 
@@ -283,7 +283,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.isVoting {
 			log.Printf("Node %d (prevTerm=%d) cancel a vote due to AppendEntries.", rf.me, rf.currentTerm)
 			rf.isVoting = false
-			rf.updateTerm(args.Term)
 			rf.votedFor = args.LeaderId
 		}
 	}
@@ -295,8 +294,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.isVoting {
 			log.Printf("Node %d (prevTerm=%d) cancel a vote due to AppendEntries.", rf.me, rf.currentTerm)
 		}
-		rf.isLeader = false
-		rf.isVoting = false
 		rf.updateTerm(args.Term)
 		rf.votedFor = args.LeaderId
 	}
@@ -326,13 +323,21 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // Term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	//index := -1
+	//term := -1
+	//isLeader := true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := len(rf.log)
+	if !rf.isLeader {
+		return 0, rf.currentTerm, false
+	}
+	rf.log = append(rf.log, command)
+	rf.heartBeat()
 
-	return index, term, isLeader
+	return index, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -409,7 +414,7 @@ outer:
 			if !reply.Success {
 				assert(rf.currentTerm < reply.Term, "currentTerm >= reply.Term!")
 				log.Printf("Node %d (term=%d) observed Term %d, no longer a leader\n", rf.me, rf.currentTerm, reply.Term)
-				rf.isLeader = false
+				assert(!rf.isVoting, "should not happen!")
 				rf.updateTerm(reply.Term)
 				break outer
 			}
