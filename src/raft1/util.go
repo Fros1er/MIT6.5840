@@ -51,6 +51,13 @@ func mutexLocked(m *sync.Mutex) bool {
 	//return state.Int()&1 == 1
 }
 
+func If[T any](cond bool, vtrue T, vfalse func() T) T {
+	if cond {
+		return vtrue
+	}
+	return vfalse()
+}
+
 func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	c := make(chan struct{})
 	go func() {

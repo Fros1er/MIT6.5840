@@ -8,6 +8,8 @@ package raft
 
 import (
 	"log"
+	"sort"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -28,6 +30,8 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	applyCh chan raftapi.ApplyMsg
+
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -39,14 +43,17 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	isLeader           bool
-	nextIndex          []int
-	matchIndex         []int
-	receivedFromLeader chan struct{}
+	isLeader bool
 
-	isVoting  bool
-	voted     []bool
-	votedLock sync.Mutex
+	// leader only
+	nextIndex  []int
+	matchIndex []int
+
+	// custom
+	receivedFromLeader chan struct{}
+	isVoting           bool
+	voted              []bool
+	votedLock          sync.Mutex
 }
 
 func electionTimeout() time.Duration {
@@ -243,6 +250,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesLogs struct {
+	Logs  []any
+	Terms []int
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type AppendEntriesArgs struct {
@@ -251,7 +263,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []any
+	Entries      AppendEntriesLogs
 	LeaderCommit int
 }
 
@@ -263,20 +275,30 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+type AppendEntriesChanReply struct {
+	reply        AppendEntriesReply
+	i            int
+	newNextIndex int
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	assert(args.LeaderId != rf.me, "self AppendEntries should not happen")
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	FTracef("Node %d enter AppendE", rf.me)
+	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
 		log.Printf("Node %d (term=%d) observed outdated AppendEntries from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
-		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	log.Printf("Node %d (term=%d): received AppendEntries from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	if args.Entries.Logs == nil {
+		log.Printf("Node %d (term=%d): heartbeat from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	} else {
+		log.Printf("Node %d (term=%d): received AppendEntries from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	}
 
 	if args.Term == rf.currentTerm {
 		assert(!rf.isLeader, "term have two leader!")
@@ -298,11 +320,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = args.LeaderId
 	}
 
-	reply.Success = true
 	select {
 	case rf.receivedFromLeader <- struct{}{}:
 	default:
 	}
+
+	// handle logs
+	if args.PrevLogTerm != -1 && (args.PrevLogIndex >= len(rf.log) || args.PrevLogTerm != rf.logTerm[args.PrevLogIndex]) {
+		// No prev log
+		log.Printf("Node %d: no log (idx=%d,term=%d), reject AppendEntries.", rf.me, args.PrevLogIndex, args.PrevLogTerm)
+		reply.Success = false
+		return
+	}
+
+	reply.Success = true
+	if args.Entries.Logs != nil {
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries.Logs...)
+		rf.logTerm = append(rf.logTerm[:args.PrevLogIndex+1], args.Entries.Terms...)
+		log.Printf("Node %d: new log inserted.", rf.me)
+	}
+	if rf.commitIndex != args.LeaderCommit {
+		for i := rf.commitIndex + 1; i <= args.LeaderCommit; i++ {
+			log.Printf("Node %d (Follower): Log '%v' (idx %d) has committed", rf.me, rf.log[i], i)
+			rf.applyCh <- raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i],
+				CommandIndex: i,
+			}
+		}
+		log.Printf("Node %d: commitIdx updated from %d to %d.", rf.me, rf.commitIndex, args.LeaderCommit)
+		rf.commitIndex = args.LeaderCommit
+	}
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -335,6 +384,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return 0, rf.currentTerm, false
 	}
 	rf.log = append(rf.log, command)
+	rf.logTerm = append(rf.logTerm, rf.currentTerm)
+	rf.matchIndex[rf.me] = index
+
+	log.Printf("Node %d received command %s, log (idx=%d,term=%d)", rf.me, command, index, rf.currentTerm)
+
 	rf.heartBeat()
 
 	return index, rf.currentTerm, true
@@ -371,7 +425,7 @@ func (rf *Raft) startVoting() {
 	rf.votedLock.Lock()
 	clear(rf.voted)
 	rf.votedLock.Unlock()
-	log.Printf("Node %d timeout, startVoting for term %d\n", rf.me, rf.currentTerm)
+	log.Printf("Node %d timeout, startVoting for term %d", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) heartBeat() {
@@ -379,17 +433,28 @@ func (rf *Raft) heartBeat() {
 	assert(rf.isLeader, "Non-leader called heartbeat!")
 	FTracef("Node %d enter heartbeat", rf.me)
 
-	arg := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-
-	replyChan := make(chan AppendEntriesReply, len(rf.peers))
+	replyChan := make(chan AppendEntriesChanReply, len(rf.peers))
 	timeoutChan := make(chan struct{})
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
+		curIdx := rf.nextIndex[i]
+		assert(curIdx >= 0, "Current index not >= 0!")
+		assert(curIdx <= len(rf.log), "Current index > len(rf.log)!")
+
+		arg := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: curIdx - 1,
+			PrevLogTerm:  If(curIdx == 0, -1, func() int { return rf.logTerm[curIdx-1] }),
+			LeaderCommit: rf.commitIndex,
+		}
+		if curIdx < len(rf.log) {
+			arg.Entries.Logs = rf.log[curIdx:]
+			arg.Entries.Terms = rf.logTerm[curIdx:]
+		}
+
 		go func() {
 			reply := AppendEntriesReply{}
 			ok := rf.sendAppendEntries(i, &arg, &reply)
@@ -397,7 +462,11 @@ func (rf *Raft) heartBeat() {
 			case <-timeoutChan:
 			default:
 				if ok {
-					replyChan <- reply
+					replyChan <- AppendEntriesChanReply{
+						reply:        reply,
+						i:            i,
+						newNextIndex: len(rf.log),
+					}
 				}
 			}
 		}()
@@ -411,15 +480,41 @@ outer:
 	for {
 		select {
 		case reply := <-replyChan:
-			if !reply.Success {
-				assert(rf.currentTerm < reply.Term, "currentTerm >= reply.Term!")
-				log.Printf("Node %d (term=%d) observed Term %d, no longer a leader\n", rf.me, rf.currentTerm, reply.Term)
-				assert(!rf.isVoting, "should not happen!")
-				rf.updateTerm(reply.Term)
-				break outer
+			if reply.reply.Success {
+				if rf.nextIndex[reply.i] != reply.newNextIndex || rf.matchIndex[reply.i] != reply.newNextIndex-1 {
+					log.Printf("Node %d AppendEntries succeed, newNextIdx is %d", reply.i, reply.newNextIndex)
+				}
+				rf.nextIndex[reply.i] = reply.newNextIndex
+				rf.matchIndex[reply.i] = reply.newNextIndex - 1
+			} else {
+				term := reply.reply.Term
+				assert(rf.currentTerm <= term, "currentTerm > reply.Term!")
+				if rf.currentTerm < term {
+					log.Printf("Node %d (term=%d) observed Term %d, no longer a leader", rf.me, rf.currentTerm, term)
+					assert(!rf.isVoting, "should not happen!")
+					rf.updateTerm(term)
+					break outer
+				} else {
+					rf.nextIndex[reply.i] -= 1
+					log.Printf("Node %d AppendEntries failed, try index %d next", reply.i, rf.nextIndex[reply.i])
+				}
 			}
 		case <-timeoutChan:
 			break outer
+		}
+	}
+
+	copied := append([]int(nil), rf.matchIndex...)
+	sort.Ints(copied)
+	idxShouldCommitted := len(rf.peers)/2 + 1
+	assert(copied[idxShouldCommitted] >= rf.commitIndex, "New commit idx is smaller")
+	if copied[idxShouldCommitted] > rf.commitIndex {
+		rf.commitIndex = copied[idxShouldCommitted]
+		log.Printf("Node %d (Leader): Log '%v' (idx %d) has committed", rf.me, rf.log[rf.commitIndex], rf.commitIndex)
+		rf.applyCh <- raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.commitIndex],
+			CommandIndex: rf.commitIndex,
 		}
 	}
 }
@@ -560,6 +655,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		receivedFromLeader: make(chan struct{}),
 		isVoting:           false,
 		voted:              make([]bool, n),
+		commitIndex:        -1,
+		applyCh:            applyCh,
 	}
 	rf.peers = peers
 	rf.persister = persister
