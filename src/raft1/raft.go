@@ -57,6 +57,10 @@ type Raft struct {
 	votedLock          sync.Mutex
 }
 
+func (rf *Raft) GetId() int {
+	return rf.me
+}
+
 func electionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(1500+rand.Int63n(1000))
 }
@@ -215,7 +219,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		assertf(rf.isVoting == false, "Should not happen")
 		assert(rf.isLeader == false, "Should not happen")
 		lastLogIndex, lastLogTerm := rf.lastLogInfo()
-		if args.LastLogTerm >= lastLogTerm && args.LastLogIndex >= lastLogIndex {
+
+		//selfLogIsNewer := false
+		//if args.LastLogTerm > lastLogTerm {
+		//	selfLogIsNewer = false
+		//} else if args.LastLogTerm < lastLogTerm {
+		//	selfLogIsNewer = true
+		//} else { // eq
+		//	selfLogIsNewer = args.LastLogIndex < lastLogIndex
+		//}
+		// compare term first, then idx
+		selfLogIsNewer := args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex)
+
+		if !selfLogIsNewer {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			log.Printf("Node %d (prevTerm=%d) vote to Node %d (term=%d)\n", rf.me, rf.currentTerm, args.CandidateId, args.Term)
@@ -224,7 +240,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			default:
 			}
 		} else {
-			todo()
+			reply.VoteGranted = false
+			log.Printf("Node %d (term=%d) No vote to Node %d (term=%d): log is newer(self %s vs candidate Log(idx=%d,term=%d))\n", rf.me, rf.currentTerm, args.CandidateId, args.Term, rf.formatLog(lastLogIndex), args.LastLogIndex, args.LastLogTerm)
+			return
 		}
 		return
 	} else {
@@ -309,7 +327,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.Entries.Logs == nil {
-		log.Printf("Node %d (term=%d): heartbeat from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+		//log.Printf("Node %d (term=%d): heartbeat from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 	} else {
 		log.Printf("Node %d (term=%d): received AppendEntries from Node %d (term=%d)", rf.me, rf.currentTerm, args.LeaderId, args.Term)
 	}
@@ -433,6 +451,7 @@ func (rf *Raft) startVoting() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	FTracef("Node %d enter startVoting", rf.me)
+	assert(!rf.isLeader, "Leader triggered startVoting!")
 
 	rf.isVoting = true
 	rf.isLeader = false
@@ -444,7 +463,8 @@ func (rf *Raft) startVoting() {
 	log.Printf("Node %d timeout, startVoting for term %d", rf.me, rf.currentTerm)
 }
 
-func (rf *Raft) heartBeat() {
+// If one AppendEntries failed with wrong index, return true to accelerate next retry
+func (rf *Raft) heartBeat() bool {
 	assert(mutexLocked(&rf.mu), "mutex should be locked when heartBeat")
 	assert(rf.isLeader, "Non-leader called heartbeat!")
 	FTracef("Node %d enter heartbeat", rf.me)
@@ -492,6 +512,8 @@ func (rf *Raft) heartBeat() {
 		close(timeoutChan)
 	}()
 
+	hasFailure := false
+
 outer:
 	for {
 		select {
@@ -512,7 +534,8 @@ outer:
 					break outer
 				} else {
 					rf.nextIndex[reply.i] -= 1
-					log.Printf("Node %d AppendEntries failed, try index %d next", reply.i, rf.nextIndex[reply.i])
+					log.Printf("Node %d (Leader): Node %d AppendEntries failed, try index %d next", rf.me, reply.i, rf.nextIndex[reply.i])
+					hasFailure = true
 				}
 			}
 		case <-timeoutChan:
@@ -526,16 +549,19 @@ outer:
 	if rf.logTerm[committedIdx] == rf.currentTerm {
 		assert(committedIdx >= rf.commitIndex, "New commit idx is smaller")
 		if committedIdx > rf.commitIndex {
-			rf.commitIndex = committedIdx
-			log.Printf("Node %d (Leader): %s has committed", rf.me, rf.formatLog(committedIdx))
-			rf.applyCh <- raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[rf.commitIndex],
-				CommandIndex: rf.commitIndex,
+			for i := rf.commitIndex + 1; i <= committedIdx; i++ {
+				log.Printf("Node %d (Leader): %s has committed", rf.me, rf.formatLog(i))
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i],
+					CommandIndex: i,
+				}
 			}
+			log.Printf("Node %d (Leader): commitIdx updated from %d to %d.", rf.me, rf.commitIndex, committedIdx)
+			rf.commitIndex = committedIdx
 		}
 	}
-
+	return hasFailure
 }
 
 func (rf *Raft) doVote() {
@@ -616,31 +642,53 @@ func (rf *Raft) ticker() {
 		timeout := electionTimeout()
 		start := time.Now()
 		for {
-			if !(time.Since(start) < timeout) {
+			rf.mu.Lock()
+			isLeader := rf.isLeader
+			rf.mu.Unlock()
+			if !isLeader && !(time.Since(start) < timeout) {
 				break
 			}
 
 			startInner := time.Now()
 			rf.mu.Lock()
 			FTracef("Node %d enter ticker, with %t %t", rf.me, rf.isLeader, rf.isVoting)
+			nextDuration := time.Millisecond*time.Duration(50+rand.Int63n(100)) - time.Since(startInner)
+			//nextDuration := time.Millisecond*time.Duration(60) - time.Since(startInner)
+			needFasterRetry := false
 			if rf.isVoting {
 				rf.doVote()
 			} else if rf.isLeader {
-				rf.heartBeat()
+				needFasterRetry = rf.heartBeat()
+				if needFasterRetry {
+					log.Printf("Node %d faster retry", rf.me)
+				}
 			}
 			rf.mu.Unlock()
+			if !needFasterRetry {
+				select {
+				case <-time.After(nextDuration):
+					// Do nothing
+				case <-time.After(timeout - time.Since(start)):
+					break
+				case <-rf.receivedFromLeader:
+					// guarantee we are follower here
+					start = time.Now()
+				}
+			}
 			select {
-			case <-time.After(time.Millisecond*time.Duration(50+rand.Int63n(100)) - time.Since(startInner)):
-				// Do nothing
-			case <-time.After(timeout - time.Since(start)):
-				break
 			case <-rf.receivedFromLeader:
 				// guarantee we are follower here
 				start = time.Now()
+			default:
 			}
 		}
+		rf.mu.Lock()
+		isLeader := rf.isLeader
+		rf.mu.Unlock()
 		// timeout!
-		rf.startVoting()
+		if !isLeader {
+			rf.startVoting()
+		}
 	}
 
 	// pause for a random amount of time between 50 and 350
